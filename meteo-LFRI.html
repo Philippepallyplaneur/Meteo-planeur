@@ -417,7 +417,7 @@ body { background: var(--bg); color: var(--text); font-family: system-ui, -apple
     </div>
   </div>
   <div class="header-right">
-    <div id="clock">04:31Z</div>
+    <div id="clock">04:57Z</div>
     <button class="btn" onclick="loadAll()">↻ Actualiser</button>
     <button class="btn btn-save" onclick="save()">💾 Sauvegarder</button>
   </div>
@@ -452,16 +452,18 @@ body { background: var(--bg); color: var(--text); font-family: system-ui, -apple
 
     <div class="card">
       <div class="card-title">Fenêtre optimale</div>
-      <div id="fenetre-content">
-        <div style="color:var(--text3);font-family:var(--mono);font-size:12px">Calcul...</div>
-      </div>
+      <div id="fenetre-content"><div style="color:#f85149;padding:20px;font-family:monospace;font-size:13px">
+      Erreur: Failed to fetch<br>Error: Failed to fetch
+    at about:srcdoc:154:31
+    </div></div>
     </div>
 
     <div class="card">
       <div class="card-title">Alertes</div>
-      <div id="alertes-content">
-        <div style="color:var(--text3);font-size:12px">Analyse...</div>
-      </div>
+      <div id="alertes-content"><div style="color:#f85149;padding:20px;font-family:monospace;font-size:13px">
+      Erreur: Failed to fetch<br>Error: Failed to fetch
+    at about:srcdoc:154:31
+    </div></div>
     </div>
 
     <div class="card">
@@ -508,7 +510,10 @@ body { background: var(--bg); color: var(--text); font-family: system-ui, -apple
     <div class="card">
       <div class="card-title">Créneaux horaires — Score thermique</div>
       <div class="slots-wrap">
-        <div class="slots-grid" id="slots-grid"><div style="color:var(--red);padding:20px;font-family:var(--mono)">Erreur: Failed to fetch</div></div>
+        <div class="slots-grid" id="slots-grid"><div style="color:#f85149;padding:20px;font-family:monospace;font-size:13px">
+      Erreur: Failed to fetch<br>Error: Failed to fetch
+    at about:srcdoc:154:31
+    </div></div>
       </div>
     </div>
 
@@ -523,9 +528,10 @@ body { background: var(--bg); color: var(--text); font-family: system-ui, -apple
     <!-- METRIQUES -->
     <div class="card">
       <div class="card-title">Paramètres convectifs clés</div>
-      <div class="metrics-grid" id="metrics-grid">
-        <div style="color:var(--text3);font-family:var(--mono);font-size:12px;grid-column:1/-1">Chargement...</div>
-      </div>
+      <div class="metrics-grid" id="metrics-grid"><div style="color:#f85149;padding:20px;font-family:monospace;font-size:13px">
+      Erreur: Failed to fetch<br>Error: Failed to fetch
+    at about:srcdoc:154:31
+    </div></div>
     </div>
 
   </div>
@@ -639,8 +645,14 @@ async function loadAll() {
 
     selectDay(0);
   } catch(e) {
-    document.getElementById('slots-grid').innerHTML =
-      `<div style="color:var(--red);padding:20px;font-family:var(--mono)">Erreur: ${e.message}</div>`;
+    console.error('Erreur dashboard:', e);
+    const msg = `<div style="color:#f85149;padding:20px;font-family:monospace;font-size:13px">
+      Erreur: ${e.message}<br>${e.stack || ''}
+    </div>`;
+    document.getElementById('slots-grid').innerHTML = msg;
+    document.getElementById('fenetre-content').innerHTML = msg;
+    document.getElementById('alertes-content').innerHTML = msg;
+    document.getElementById('metrics-grid').innerHTML = msg;
   }
 }
 
