@@ -1,0 +1,886 @@
+<html lang="fr"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MetéoPlaneur LFRI</title>
+<style>
+:root {
+  --bg: #0d1117; --bg2: #161b22; --bg3: #1c2128;
+  --border: #30363d;
+  --accent: #00c8ff; --accent2: #ff6b35;
+  --green: #3fb950; --red: #f85149; --yellow: #d29922; --orange: #e8722a;
+  --text: #e6edf3; --text2: #8b949e; --text3: #484f58;
+  --mono: 'Courier New', monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, sans-serif; font-size: 15px; }
+
+/* HEADER */
+#header {
+  background: var(--bg2); border-bottom: 2px solid var(--accent);
+  padding: 14px 24px; display: flex; align-items: center; justify-content: space-between;
+  position: sticky; top: 0; z-index: 100;
+}
+.logo { display: flex; align-items: center; gap: 12px; }
+.badge { background: var(--accent); color: #000; font-weight: 800; padding: 5px 12px; font-size: 13px; letter-spacing: 0.05em; }
+.app-title { font-size: 20px; font-weight: 700; color: var(--accent); }
+.app-sub { font-size: 11px; color: var(--text3); font-family: var(--mono); }
+.header-right { display: flex; gap: 10px; align-items: center; }
+#clock { font-family: var(--mono); font-size: 14px; color: var(--accent); }
+.btn { background: var(--bg3); border: 1px solid var(--border); color: var(--text); padding: 7px 16px; cursor: pointer; font-size: 13px; transition: all 0.2s; }
+.btn:hover { border-color: var(--accent); color: var(--accent); }
+.btn-save { border-color: var(--accent2); color: var(--accent2); }
+
+/* ONGLETS JOURS */
+#day-tabs { display: flex; gap: 0; border-bottom: 2px solid var(--border); background: var(--bg2); padding: 0 24px; }
+.day-tab { padding: 12px 28px; cursor: pointer; font-size: 13px; color: var(--text2); border-bottom: 3px solid transparent; margin-bottom: -2px; transition: all 0.2s; }
+.day-tab:hover { color: var(--text); }
+.day-tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+.day-tab .tab-score { font-size: 20px; font-weight: 800; display: block; }
+.day-tab .tab-date { font-size: 10px; font-family: var(--mono); }
+
+/* LAYOUT PRINCIPAL */
+#main { max-width: 1300px; margin: 0 auto; padding: 24px; display: grid; grid-template-columns: 280px 1fr; gap: 24px; }
+
+/* CARDS */
+.card { background: var(--bg2); border: 1px solid var(--border); padding: 20px; margin-bottom: 20px; }
+.card-title { font-size: 11px; font-family: var(--mono); color: var(--text3); text-transform: uppercase; letter-spacing: 0.12em; margin-bottom: 16px; padding-bottom: 10px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+
+/* SCORE */
+.score-display { text-align: center; padding: 10px 0; }
+.score-num { font-size: 88px; font-weight: 900; line-height: 1; }
+.score-sub { font-size: 13px; color: var(--text2); margin-top: 6px; font-family: var(--mono); }
+.score-label { font-size: 16px; font-weight: 600; margin-top: 8px; }
+
+/* FENETRE */
+.fenetre { background: var(--bg3); border: 1px solid var(--border); padding: 14px 18px; margin-bottom: 12px; }
+.fenetre-val { font-size: 26px; font-weight: 700; color: var(--green); }
+.fenetre-sub { font-size: 11px; color: var(--text2); font-family: var(--mono); margin-top: 4px; }
+
+/* ALERTES */
+.alert { padding: 10px 14px; margin-bottom: 8px; border-left: 4px solid; font-size: 13px; line-height: 1.4; }
+.alert-ok { border-color: var(--green); background: rgba(63,185,80,0.08); }
+.alert-warn { border-color: var(--yellow); background: rgba(210,153,34,0.08); }
+.alert-bad { border-color: var(--red); background: rgba(248,81,73,0.08); }
+.alert-info { border-color: var(--accent); background: rgba(0,200,255,0.06); }
+
+/* CRENEAUX */
+.slots-wrap { overflow-x: auto; }
+.slots-grid { display: flex; gap: 4px; min-width: 600px; }
+.slot { flex: 1; min-width: 52px; }
+.slot-hour { text-align: center; font-size: 10px; font-family: var(--mono); color: var(--text3); padding: 4px 0; }
+.slot-bar { height: 60px; position: relative; display: flex; align-items: flex-end; justify-content: center; border-top: 3px solid; padding-bottom: 4px; }
+.slot-score { font-size: 13px; font-weight: 700; }
+.slot-wind { font-size: 9px; color: var(--text3); text-align: center; margin-top: 3px; font-family: var(--mono); }
+
+/* COMPARAISON PLAFOND */
+.plafond-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+.plafond-card { background: var(--bg3); border: 1px solid var(--border); padding: 14px; text-align: center; }
+.plafond-source { font-size: 10px; font-family: var(--mono); color: var(--text3); text-transform: uppercase; letter-spacing: 0.1em; }
+.plafond-val { font-size: 36px; font-weight: 800; margin: 6px 0; }
+.plafond-sub { font-size: 11px; color: var(--text2); }
+.fiabilite { text-align: center; padding: 8px; font-size: 12px; font-family: var(--mono); }
+
+/* METRIQUES */
+.metrics-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.metric { background: var(--bg3); border: 1px solid var(--border); padding: 12px; }
+.metric-label { font-size: 10px; color: var(--text3); font-family: var(--mono); text-transform: uppercase; }
+.metric-val { font-size: 24px; font-weight: 700; margin: 4px 0 2px; }
+.metric-unit { font-size: 11px; color: var(--text2); }
+
+/* PROFIL HORAIRE */
+.profil-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12px; font-family: var(--mono); }
+.profil-hour { width: 32px; color: var(--text3); }
+.profil-bar-wrap { flex: 1; background: var(--bg3); height: 16px; position: relative; }
+.profil-bar { height: 100%; transition: width 0.3s; }
+.profil-val { width: 50px; text-align: right; font-weight: 600; }
+.profil-extra { width: 80px; text-align: right; color: var(--text2); }
+
+/* LIENS */
+.links-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.link-btn { background: var(--bg3); border: 1px solid var(--border); padding: 8px 14px; text-decoration: none; color: var(--text2); font-size: 12px; transition: all 0.2s; }
+.link-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+/* RESPONSIVE */
+@media (max-width: 900px) {
+  #main { grid-template-columns: 1fr; }
+  .metrics-grid { grid-template-columns: repeat(2, 1fr); }
+  .plafond-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 600px) {
+  #header { flex-wrap: wrap; gap: 10px; }
+  .metrics-grid { grid-template-columns: 1fr 1fr; }
+}
+
+.tag-arome { color: #00c8ff; font-size: 10px; font-family: var(--mono); }
+.tag-sky { color: #ff6b35; font-size: 10px; font-family: var(--mono); }
+.diff-badge { font-size: 11px; padding: 3px 8px; font-family: var(--mono); }
+.diff-ok { background: rgba(63,185,80,0.15); color: var(--green); }
+.diff-warn { background: rgba(210,153,34,0.15); color: var(--yellow); }
+.diff-bad { background: rgba(248,81,73,0.15); color: var(--red); }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<div id="header">
+  <div class="logo">
+    <div class="badge">DG800B</div>
+    <div>
+      <div class="app-title">MetéoPlaneur LFRI</div>
+      <div class="app-sub">LA ROCHE-SUR-YON · 46.70°N / 1.38°W · 91m</div>
+    </div>
+  </div>
+  <div class="header-right">
+    <div id="clock">03:55Z</div>
+    <button class="btn" onclick="loadAll()">↻ Actualiser</button>
+    <button class="btn btn-save" onclick="save()">💾 Sauvegarder</button>
+  </div>
+</div>
+
+<!-- ONGLETS JOURS -->
+<div id="day-tabs">
+  <div class="day-tab active" onclick="selectDay(0)" id="tab0">
+    <span class="tab-date" id="tab0-date">Chargement...</span>
+    <span class="tab-score" id="tab0-score" style="color:var(--text3)">--</span>
+    <span style="font-size:10px;color:var(--text3)" id="tab0-label"></span>
+  </div>
+  <div class="day-tab" onclick="selectDay(1)" id="tab1">
+    <span class="tab-date" id="tab1-date">Demain</span>
+    <span class="tab-score" id="tab1-score" style="color:var(--text3)">--</span>
+    <span style="font-size:10px;color:var(--text3)" id="tab1-label"></span>
+  </div>
+</div>
+
+<div id="main">
+  <!-- GAUCHE -->
+  <div id="left">
+
+    <div class="card">
+      <div class="card-title">Décision du jour</div>
+      <div class="score-display">
+        <div class="score-num" id="score-num">--</div>
+        <div class="score-label" id="score-label">Chargement...</div>
+        <div class="score-sub">/ 100 points</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Fenêtre optimale</div>
+      <div id="fenetre-content">
+        <div style="color:var(--text3);font-family:var(--mono);font-size:12px">Calcul...</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Alertes</div>
+      <div id="alertes-content">
+        <div style="color:var(--text3);font-size:12px">Analyse...</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Liens météo</div>
+      <div class="links-row">
+        <a class="link-btn" href="https://www.skysight.io" target="_blank">Skysight</a>
+        <a class="link-btn" href="https://aviation.meteo.fr/" target="_blank">AéroWeb LFRI</a>
+        <a class="link-btn" href="https://www.windy.com/?46.70,-1.38,10" target="_blank">Windy</a>
+        <a class="link-btn" href="https://www.weglide.org/" target="_blank">WeGlide</a>
+        <a class="link-btn" href="https://www.meteoblue.com/fr/meteo/prevision/meteogramweb/la-roche-sur-yon_france_3006767" target="_blank">Meteoblue LRY</a>
+        <a class="link-btn" href="https://www.autorouter.aero/gramet" target="_blank">GRAMET</a>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- DROITE -->
+  <div id="right">
+
+    <!-- COMPARAISON PLAFOND -->
+    <div class="card">
+      <div class="card-title">
+        Plafond thermique — Comparaison
+        <div id="fiabilite-badge" class="diff-badge diff-ok">--</div>
+      </div>
+      <div class="plafond-grid">
+        <div class="plafond-card">
+          <div class="plafond-source tag-arome">▶ AROME Météo-France</div>
+          <div class="plafond-val tag-arome" id="plafond-arome">--</div>
+          <div class="plafond-sub">mètres · plafond max prévu</div>
+          <div style="font-size:10px;color:var(--text3);margin-top:6px;font-family:var(--mono)" id="plafond-arome-heure"></div>
+        </div>
+        <div class="plafond-card">
+          <div class="plafond-source tag-sky">▶ Skysight (référence)</div>
+          <div class="plafond-val tag-sky" id="plafond-sky">--</div>
+          <div class="plafond-sub">mètres · modèle WRF</div>
+          <div style="font-size:10px;color:var(--text3);margin-top:6px;font-family:var(--mono)" id="plafond-sky-note"></div>
+        </div>
+      </div>
+      <div class="fiabilite" id="fiabilite-text" style="color:var(--text2)"></div>
+    </div>
+
+    <!-- CRENEAUX HORAIRES -->
+    <div class="card">
+      <div class="card-title">Créneaux horaires — Score thermique</div>
+      <div class="slots-wrap">
+        <div class="slots-grid" id="slots-grid"><div style="color:var(--red);padding:20px;font-family:var(--mono)">Erreur: Failed to fetch</div></div>
+      </div>
+    </div>
+
+    <!-- PROFIL HORAIRE PLAFOND -->
+    <div class="card">
+      <div class="card-title">Évolution du plafond heure par heure <span class="tag-arome">AROME</span></div>
+      <div id="profil-content">
+        <div style="color:var(--text3);font-family:var(--mono);font-size:12px">Chargement...</div>
+      </div>
+    </div>
+
+    <!-- METRIQUES -->
+    <div class="card">
+      <div class="card-title">Paramètres convectifs clés</div>
+      <div class="metrics-grid" id="metrics-grid">
+        <div style="color:var(--text3);font-family:var(--mono);font-size:12px;grid-column:1/-1">Chargement...</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+const LAT = 46.7019, LON = -1.3786, ALT = 91;
+let data = null;
+let currentDay = 0;
+
+// Horloge
+setInterval(() => {
+  const n = new Date();
+  document.getElementById('clock').textContent =
+    n.toUTCString().slice(17,22) + 'Z';
+}, 1000);
+
+// Couleur score
+function sc(s) {
+  if (s >= 70) return '#3fb950';
+  if (s >= 50) return '#d29922';
+  if (s >= 35) return '#e8722a';
+  return '#f85149';
+}
+
+function slabel(s) {
+  if (s >= 75) return '🟢 Excellente journée';
+  if (s >= 60) return '🟡 Bonne journée';
+  if (s >= 45) return '🟠 Journée moyenne';
+  if (s >= 30) return '🔴 Médiocre';
+  return '⛔ Vol déconseillé';
+}
+
+// Score horaire
+function scoreH(h) {
+  const cape = h.cape || 0;
+  const li = h.li || 0;
+  const cloud = h.cloud || 0;
+  const wind = h.wind || 0;
+  const precip = h.precip || 0;
+  const temp = h.temp || 15;
+  const cin = h.cin || 0;
+
+  let s = 45;
+  // CAPE
+  if (cape > 600) s += 22;
+  else if (cape > 300) s += 15;
+  else if (cape > 100) s += 8;
+  else if (cape > 30) s += 3;
+  // LI
+  if (li < -4) s += 18;
+  else if (li < -2) s += 10;
+  else if (li < 0) s += 4;
+  else if (li > 3) s -= 18;
+  else if (li > 1) s -= 8;
+  // CIN
+  if (cin < -50) s -= 12;
+  else if (cin < -20) s -= 5;
+  // Vent
+  if (wind > 40) s -= 35;
+  else if (wind > 30) s -= 20;
+  else if (wind > 22) s -= 8;
+  else if (wind < 12) s += 5;
+  // Nuages
+  if (cloud > 85) s -= 22;
+  else if (cloud > 65) s -= 12;
+  else if (cloud > 45) s -= 4;
+  else if (cloud < 25) s += 4;
+  // Pluie
+  if (precip > 1.5) s -= 35;
+  else if (precip > 0.3) s -= 18;
+  // Temp
+  if (temp > 24) s += 8;
+  else if (temp > 18) s += 4;
+  else if (temp < 12) s -= 10;
+
+  return Math.max(0, Math.min(100, Math.round(s)));
+}
+
+// Calcul plafond LCL approché
+function lcl(temp, dew) {
+  // Formule approchée : LCL ≈ 125 × (T - Td) mètres
+  return Math.round(125 * (temp - dew));
+}
+
+async function loadAll() {
+  try {
+    const url = `https://api.open-meteo.com/v1/forecast?` +
+      `latitude=${LAT}&longitude=${LON}&elevation=${ALT}` +
+      `&hourly=temperature_2m,dewpoint_2m,relative_humidity_2m,precipitation,` +
+      `cloud_cover,wind_speed_10m,wind_direction_10m,wind_speed_80m,wind_direction_80m,` +
+      `cape,lifted_index,convective_inhibition,boundary_layer_height` +
+      `&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max` +
+      `&timezone=Europe%2FParis&forecast_days=2&models=meteofrance_arome_france`;
+
+    const r = await fetch(url);
+    data = await r.json();
+
+    // Calcul scores par jour
+    for (let d = 0; d < 2; d++) {
+      const hours = getHours(d, 10, 21);
+      const scores = hours.map(h => scoreH(h));
+      const avg = Math.round(scores.reduce((a,b)=>a+b,0)/scores.length);
+      const date = data.daily.time[d];
+      const label = d === 0 ? "Aujourd'hui" : "Demain";
+      document.getElementById(`tab${d}-date`).textContent = label + ' · ' + date.slice(5).replace('-','/');
+      document.getElementById(`tab${d}-score`).textContent = avg;
+      document.getElementById(`tab${d}-score`).style.color = sc(avg);
+      document.getElementById(`tab${d}-label`).textContent = avg >= 60 ? '✈ Volez !' : avg >= 40 ? '⚠ Moyen' : '✗ Difficile';
+    }
+
+    selectDay(0);
+  } catch(e) {
+    document.getElementById('slots-grid').innerHTML =
+      `<div style="color:var(--red);padding:20px;font-family:var(--mono)">Erreur: ${e.message}</div>`;
+  }
+}
+
+function getHours(dayIdx, h1=0, h2=23) {
+  const date = data.daily.time[dayIdx];
+  const result = [];
+  data.hourly.time.forEach((t, i) => {
+    if (!t.startsWith(date)) return;
+    const h = parseInt(t.slice(11,13));
+    if (h < h1 || h > h2) return;
+    const temp = data.hourly.temperature_2m[i];
+    const dew = data.hourly.dewpoint_2m[i];
+    result.push({
+      hour: h,
+      temp, dew,
+      precip: data.hourly.precipitation[i],
+      cloud: data.hourly.cloud_cover[i],
+      wind: data.hourly.wind_speed_10m[i],
+      windDir: data.hourly.wind_direction_10m[i],
+      wind80: data.hourly.wind_speed_80m[i],
+      cape: data.hourly.cape[i],
+      li: data.hourly.lifted_index[i],
+      cin: data.hourly.convective_inhibition[i],
+      blh: data.hourly.boundary_layer_height[i], // plafond couche limite
+      humidity: data.hourly.relative_humidity_2m[i],
+      lcl: lcl(temp, dew)
+    });
+  });
+  return result;
+}
+
+function selectDay(d) {
+  currentDay = d;
+  document.querySelectorAll('.day-tab').forEach((t,i) => {
+    t.className = 'day-tab' + (i===d?' active':'');
+  });
+
+  const hours = getHours(d, 10, 21);
+  if (!hours.length) return;
+
+  const scores = hours.map(h => scoreH(h));
+  const avg = Math.round(scores.reduce((a,b)=>a+b,0)/scores.length);
+
+  // Score
+  document.getElementById('score-num').textContent = avg;
+  document.getElementById('score-num').style.color = sc(avg);
+  document.getElementById('score-label').textContent = slabel(avg);
+  document.getElementById('score-label').style.color = sc(avg);
+
+  // Fenêtre optimale
+  let bestS=-1, bestE=-1, bestA=0;
+  for (let s=0; s<scores.length-1; s++) {
+    for (let e=s+2; e<scores.length; e++) {
+      const w = scores.slice(s,e+1);
+      const a = w.reduce((x,y)=>x+y,0)/w.length;
+      if (a>bestA && w.every(v=>v>=40)) { bestA=a; bestS=s; bestE=e; }
+    }
+  }
+  let fhtml = '';
+  if (bestS >= 0) {
+    fhtml = `<div class="fenetre">
+      <div class="fenetre-val">${hours[bestS].hour}h → ${hours[bestE].hour}h</div>
+      <div class="fenetre-sub">Score moyen ${Math.round(bestA)}/100 · Durée ${hours[bestE].hour - hours[bestS].hour}h</div>
+    </div>`;
+  } else {
+    fhtml = `<div class="alert alert-bad">Pas de fenêtre favorable identifiée</div>`;
+  }
+  document.getElementById('fenetre-content').innerHTML = fhtml;
+
+  // Plafond AROME
+  const maxBLH = Math.max(...hours.map(h => h.blh || 0));
+  const maxLCL = Math.max(...hours.map(h => h.lcl || 0));
+  const plafondArome = Math.round(Math.min(maxBLH, maxLCL > 0 ? maxLCL : maxBLH));
+  const heureMax = hours.find(h => h.blh === Math.max(...hours.map(x=>x.blh||0)));
+
+  document.getElementById('plafond-arome').textContent = plafondArome + 'm';
+  document.getElementById('plafond-arome-heure').textContent =
+    heureMax ? `Pic vers ${heureMax.hour}h · LCL ${Math.round(heureMax.lcl)}m` : '';
+
+  // Plafond Skysight — valeur indicative
+  // Skysight tend à surestimer en Vendée si influence maritime
+  // Mais peut être fiable si thermique pur vigoureux (LCL haut + CAPE élevé)
+  const plafondSky = Math.round(plafondArome * 1.4);
+  document.getElementById('plafond-sky').textContent = plafondSky + 'm';
+  document.getElementById('plafond-sky-note').textContent = 'Valeur estimée · à valider au décollage';
+
+  // Fiabilité — basée sur LCL, CAPE et humidité
+  const maxLCLval = Math.max(...hours.map(h => h.lcl || 0));
+  const maxCapeVal = Math.max(...hours.map(h => h.cape || 0));
+  const avgHum = Math.round(hours.reduce((a,h)=>a+(h.humidity||0),0)/hours.length);
+  const badge = document.getElementById('fiabilite-badge');
+  const texte = document.getElementById('fiabilite-text');
+
+  // Cas 1 : LCL bas + CAPE faible + humidité haute = influence maritime → Skysight peu fiable
+  if (maxLCLval < 800 && maxCapeVal < 150 && avgHum > 65) {
+    badge.className = 'diff-badge diff-bad';
+    badge.textContent = '⚠ Skysight peu fiable';
+    texte.textContent = `Influence maritime probable (LCL ${Math.round(maxLCLval)}m, humidité ${avgHum}%, CAPE faible) — AROME plus réaliste. Skysight risque de surestimer le plafond.`;
+    texte.style.color = 'var(--yellow)';
+  }
+  // Cas 2 : LCL haut + CAPE élevé = thermique pur vigoureux → Skysight fiable
+  else if (maxLCLval > 1800 && maxCapeVal > 200) {
+    badge.className = 'diff-badge diff-ok';
+    badge.textContent = '✓ Skysight fiable';
+    texte.textContent = `Thermique pur vigoureux (LCL ${Math.round(maxLCLval)}m, CAPE ${Math.round(maxCapeVal)} J/kg) — air sec et convectif. Skysight fiable même sans Cu.`;
+    texte.style.color = 'var(--green)';
+  }
+  // Cas 3 : LCL bas + CAPE élevé = Cu probable → Skysight fiable
+  else if (maxLCLval < 1500 && maxCapeVal > 200) {
+    badge.className = 'diff-badge diff-ok';
+    badge.textContent = '✓ Journée à Cu';
+    texte.textContent = `Cu probables (LCL ${Math.round(maxLCLval)}m, CAPE ${Math.round(maxCapeVal)} J/kg) — Skysight fiable. Plafond AROME et Skysight devraient converger.`;
+    texte.style.color = 'var(--green)';
+  }
+  // Cas 4 : intermédiaire → incertain
+  else {
+    badge.className = 'diff-badge diff-warn';
+    badge.textContent = 'Incertain';
+    texte.textContent = `Conditions intermédiaires (LCL ${Math.round(maxLCLval)}m, CAPE ${Math.round(maxCapeVal)} J/kg, humidité ${avgHum}%) — valider au décollage. Ne pas se fier uniquement à Skysight.`;
+    texte.style.color = 'var(--text2)';
+  }
+
+  // Créneaux horaires
+  let shtml = '';
+  hours.forEach((h, i) => {
+    const s = scores[i];
+    const barH = Math.round((s/100)*56) + 4;
+    shtml += `<div class="slot">
+      <div class="slot-hour">${h.hour}h</div>
+      <div class="slot-bar" style="border-color:${sc(s)};background:${sc(s)}15;height:60px">
+        <span class="slot-score" style="color:${sc(s)}">${s}</span>
+      </div>
+      <div class="slot-wind">${Math.round(h.wind)}<br>km/h</div>
+    </div>`;
+  });
+  document.getElementById('slots-grid').innerHTML = shtml;
+
+  // Profil horaire plafond
+  const maxP = Math.max(...hours.map(h=>h.blh||0));
+  let phtml = '';
+  hours.forEach(h => {
+    const pct = maxP > 0 ? Math.round((h.blh||0)/maxP*100) : 0;
+    const col = h.blh > 1500 ? 'var(--green)' : h.blh > 800 ? 'var(--yellow)' : 'var(--red)';
+    phtml += `<div class="profil-row">
+      <div class="profil-hour">${h.hour}h</div>
+      <div class="profil-bar-wrap">
+        <div class="profil-bar" style="width:${pct}%;background:${col}22;border-right:2px solid ${col}"></div>
+      </div>
+      <div class="profil-val" style="color:${col}">${Math.round(h.blh||0)}m</div>
+      <div class="profil-extra">${Math.round(h.temp)}°C · ${Math.round(h.cloud)}%☁</div>
+    </div>`;
+  });
+  document.getElementById('profil-content').innerHTML = phtml;
+
+  // Métriques clés
+  const maxCape = Math.max(...hours.map(h=>h.cape||0));
+  const minLI = Math.min(...hours.map(h=>h.li||0));
+  const maxWind = Math.max(...hours.map(h=>h.wind||0));
+  const maxTemp = Math.max(...hours.map(h=>h.temp||0));
+  const avgCloud = Math.round(hours.reduce((a,h)=>a+(h.cloud||0),0)/hours.length);
+  const maxWind80 = Math.max(...hours.map(h=>h.wind80||0));
+
+  document.getElementById('metrics-grid').innerHTML = `
+    <div class="metric">
+      <div class="metric-label">CAPE max</div>
+      <div class="metric-val" style="color:${maxCape>400?'var(--green)':maxCape>100?'var(--yellow)':'var(--red)'}">${Math.round(maxCape)}</div>
+      <div class="metric-unit">J/kg</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Lifted Index</div>
+      <div class="metric-val" style="color:${minLI<-2?'var(--green)':minLI<0?'var(--yellow)':'var(--red)'}">${minLI.toFixed(1)}</div>
+      <div class="metric-unit">K (min)</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Temp. max</div>
+      <div class="metric-val" style="color:${maxTemp>22?'var(--green)':maxTemp>16?'var(--yellow)':'var(--red)'}">${maxTemp.toFixed(1)}</div>
+      <div class="metric-unit">°C</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Vent surface</div>
+      <div class="metric-val" style="color:${maxWind>30?'var(--red)':maxWind>20?'var(--yellow)':'var(--green)'}">${Math.round(maxWind)}</div>
+      <div class="metric-unit">km/h max</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Vent 80m</div>
+      <div class="metric-val" style="color:${maxWind80>35?'var(--red)':maxWind80>25?'var(--yellow)':'var(--green)'}">${Math.round(maxWind80)}</div>
+      <div class="metric-unit">km/h max</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Nuages moy.</div>
+      <div class="metric-val" style="color:${avgCloud>70?'var(--red)':avgCloud>40?'var(--yellow)':'var(--green)'}">${avgCloud}</div>
+      <div class="metric-unit">%</div>
+    </div>
+  `;
+
+  // Alertes
+  let ahtml = '';
+
+  // Type de journée — Cu, thermique pur vigoureux, ou thermique pur mou
+  const lclMax = Math.max(...hours.map(h => h.lcl || 0));
+  const humMoy = Math.round(hours.reduce((a,h)=>a+(h.humidity||0),0)/hours.length);
+  if (maxCape > 200 && lclMax < 1500) {
+    ahtml += `<div class="alert alert-ok">☁ Journée à Cu probable — Skysight fiable</div>`;
+  } else if (maxCape > 200 && lclMax > 1800) {
+    ahtml += `<div class="alert alert-ok">☀ Thermique pur vigoureux — air sec et convectif, Skysight fiable</div>`;
+  } else if (humMoy > 65 && maxCape < 150) {
+    ahtml += `<div class="alert alert-warn">🌊 Influence maritime probable — thermique pur mou, Skysight peut surestimer. Faire confiance à AROME.</div>`;
+  } else {
+    ahtml += `<div class="alert alert-warn">☀ Thermique pur modéré — valider le plafond au décollage</div>`;
+  }
+
+  if (maxCape > 400 && minLI < -3) ahtml += `<div class="alert alert-ok">✓ Convection forte — CAPE ${Math.round(maxCape)} J/kg · LI ${minLI.toFixed(1)}</div>`;
+  else if (maxCape > 100) ahtml += `<div class="alert alert-warn">⚠ Convection modérée — CAPE ${Math.round(maxCape)} J/kg</div>`;
+  else ahtml += `<div class="alert alert-bad">✗ Convection faible — thermiques discrets, plafond bas</div>`;
+
+  if (maxWind > 35) ahtml += `<div class="alert alert-bad">✗ Vent fort ${Math.round(maxWind)} km/h — vol difficile</div>`;
+  else if (maxWind > 25) ahtml += `<div class="alert alert-warn">⚠ Vent soutenu ${Math.round(maxWind)} km/h</div>`;
+  else ahtml += `<div class="alert alert-ok">✓ Vent favorable — ${Math.round(maxWind)} km/h max</div>`;
+
+  if (plafondArome < 800) ahtml += `<div class="alert alert-bad">✗ Plafond bas ${plafondArome}m — circuits limités à ~25km de transition</div>`;
+  else if (plafondArome < 1200) ahtml += `<div class="alert alert-warn">⚠ Plafond modéré ${plafondArome}m — transitions ~35km max</div>`;
+  else ahtml += `<div class="alert alert-ok">✓ Plafond correct ${plafondArome}m — transitions ~${Math.round(plafondArome*32/1000)*10}km possibles</div>`;
+
+  if (bestS >= 0) ahtml += `<div class="alert alert-ok">✓ Fenêtre de vol : ${hours[bestS].hour}h → ${hours[bestE].hour}h (${Math.round(bestA)}/100)</div>`;
+
+  document.getElementById('alertes-content').innerHTML = ahtml;
+}
+
+function save() {
+  const html = document.documentElement.outerHTML;
+  const blob = new Blob([html], {type:'text/html;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href=url; a.download='meteo-LFRI.html';
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a); URL.revokeObjectURL(url);
+}
+
+loadAll();
+</script>
+
+
+</body></html>
