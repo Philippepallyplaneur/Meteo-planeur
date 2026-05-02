@@ -417,7 +417,7 @@ body { background: var(--bg); color: var(--text); font-family: system-ui, -apple
     </div>
   </div>
   <div class="header-right">
-    <div id="clock">03:55Z</div>
+    <div id="clock">04:31Z</div>
     <button class="btn" onclick="loadAll()">↻ Actualiser</button>
     <button class="btn btn-save" onclick="save()">💾 Sauvegarder</button>
   </div>
@@ -619,7 +619,7 @@ async function loadAll() {
       `cloud_cover,wind_speed_10m,wind_direction_10m,wind_speed_80m,wind_direction_80m,` +
       `cape,lifted_index,convective_inhibition,boundary_layer_height` +
       `&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max` +
-      `&timezone=Europe%2FParis&forecast_days=2&models=meteofrance_arome_france`;
+      `&timezone=Europe%2FParis&forecast_days=2`;
 
     const r = await fetch(url);
     data = await r.json();
